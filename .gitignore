@@ -1,0 +1,10 @@
+# Node dependencies
+node_modules/
+
+# Python virtual environments
+venv/
+env/
+__pycache__/
+
+# Environment variables (CRITICAL)
+.env
