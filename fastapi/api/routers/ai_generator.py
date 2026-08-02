@@ -8,8 +8,30 @@ from typing import List
 import google.generativeai as genai
 from dotenv import load_dotenv
 
+
 import models
-from deps import get_db
+from deps import get_db, get_current_user
+import requests
+UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY")
+
+import urllib.parse
+
+def build_cover_image_url(theme: str, case_id: int) -> str:
+    query = f"{theme} noir mystery dark cinematic"
+    try:
+        res = requests.get(
+            "https://api.unsplash.com/photos/random",
+            params={"query": query, "orientation": "portrait"},
+            headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"},
+            timeout=5
+        )
+        if res.status_code == 200:
+            return res.json()["urls"]["regular"]
+        else:
+            print(f"Unsplash error {res.status_code}: {res.text}")
+    except Exception as e:
+        print(f"Unsplash fetch failed: {e}")
+    return None
 
 # Load environment variables and configure Gemini
 load_dotenv()
@@ -30,6 +52,8 @@ class SuspectSchema(BaseModel):
 class EvidenceSchema(BaseModel):
     name: str
     description: str
+    cipher_word: str  # single uppercase word, 5-11 letters, thematically tied to this evidence
+    hint: str          # one short sentence hinting at the word without giving it away
 
 class CaseSchema(BaseModel):
     title: str
@@ -37,6 +61,22 @@ class CaseSchema(BaseModel):
     backstory: str
     suspects: List[SuspectSchema]
     evidence: List[EvidenceSchema]
+
+class ProgressRequest(BaseModel):
+    case_id: int
+    evidence_id: int
+
+class ChatRequest(BaseModel):
+    case_id: int
+    suspect_id: int
+    role: str
+    text: str
+
+class ResolveRequest(BaseModel):
+    case_id: int
+    accused_suspect_id: int
+    success: bool
+    narrative: str
 
 # ---------------------------------------------------------
 # 2. THE GENERATION ENDPOINT
@@ -53,17 +93,24 @@ def generate_new_case(theme: str, db: Session = Depends(get_db)):
         prompt = f"""
         You are a master mystery writer. Generate a complete, logical murder mystery case.
         Theme: {theme}.
+        Write the content using simple, punchy, fun language. Aim for an 8th-grade reading level. Avoid overly academic or sophisticated vocabulary. 
+        Keep it gritty but easy to understand
         
         Game Mechanics:
         - Include exactly 5 suspects and exactly 6 pieces of evidence.
         - Exactly ONE suspect must have is_guilty set to true. 
         - The evidence must subtly point to the guilty suspect, but include clever red herrings to misdirect the player.
-        
+        - For each piece of evidence, also generate a "cipher_word": a single real English word (5-11 letters, no spaces or hyphens) that relates to that specific piece of evidence. This word will be used in a decryption mini-game.
+        - Also generate a "hint" for each evidence: one short, punchy sentence that gives a clue toward the cipher_word WITHOUT saying the word itself.
+                
         Stylistic Constraints:
         - The suspects MUST have realistic, natural-sounding human names appropriate for the theme.
-        - ABSOLUTELY NO cliché sci-fi titles, robotic handles, or corny aliases (e.g., do NOT use names like 'Circuit Jaxson', 'Data-Sage Elara', or 'Spectre'). Use grounded names like 'Elena Vance', 'Marcus Thorne', or 'Dr. Aris Vance'.
+        - ABSOLUTELY NO cliché sci-fi titles, robotic handles, or corny aliases (e.g., do NOT use names like 'Circuit Jaxson', 'Data-Sage Elara', or 'Spectre').
+        - Vary names across different cultural backgrounds and naming styles — do not default to the same handful of Western names (avoid overusing "Marcus," "Elena," "Vance," "Blackwood," "Thorne," "Sterling" specifically, since these are overused). Mix first/last name combinations, and draw from a wide range of ethnic and cultural naming conventions appropriate to a modern, diverse cast — for example mixing names like Priya Nakamura, Diego Osei, Freya Lindqvist, Amara Osei, Kenji Alvarez, Noor Khoury, alongside more familiar Western names, so no two suspects across different cases feel like palette-swaps of each other.
+        - No two suspects in the same case should share a surname unless they are explicitly stated to be related.
         
         Output ONLY valid JSON that matches this exact schema structure:
+        Randomize your creative choices. Do not default to your most common or expected answer — vary character names, professions, and murder weapons each time this prompt runs, even for the same theme.
         {CaseSchema.schema_json()}
         """
 
@@ -86,6 +133,9 @@ def generate_new_case(theme: str, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(new_case)
 
+        new_case.cover_image_url = build_cover_image_url(new_case.theme, new_case.id)
+        db.commit()
+
         # Loop through and save all 5 suspects
         for sus in ai_case_data.suspects:
             new_suspect = models.Suspect(
@@ -103,7 +153,9 @@ def generate_new_case(theme: str, db: Session = Depends(get_db)):
             new_evidence = models.Evidence(
                 case_id=new_case.id,
                 name=ev.name,
-                description=ev.description
+                description=ev.description,
+                cipher_word=ev.cipher_word.upper(),
+                hint=ev.hint
             )
             db.add(new_evidence)
 
@@ -196,7 +248,9 @@ def interrogate_suspect(req: InterrogationRequest, db: Session = Depends(get_db)
         # 3. Construct the Roleplay Prompt
         roleplay_prompt = f"""
         You are participating in a murder mystery roleplay. You MUST stay in character at all times. Never refer to yourself as an AI.
-        
+        Write the content using simple, punchy, fun language. Aim for an 8th-grade reading level. Avoid overly academic or sophisticated vocabulary. 
+        Keep it gritty but easy to understand
+
         YOUR IDENTITY:
         Name: {suspect.name}
         Description: {suspect.description}
@@ -239,7 +293,7 @@ class AccusationRequest(BaseModel):
     suspect_id: int
 
 @router.post("/accuse/")
-def make_accusation(req: AccusationRequest, db: Session = Depends(get_db)):
+def make_accusation(req: AccusationRequest, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     try:
         suspect = db.query(models.Suspect).filter(models.Suspect.id == req.suspect_id).first()
         case = db.query(models.Case).filter(models.Case.id == req.case_id).first()
@@ -247,31 +301,179 @@ def make_accusation(req: AccusationRequest, db: Session = Depends(get_db)):
         if not suspect or not case:
             raise HTTPException(status_code=404, detail="Data not found.")
 
-        # Check if the player is right!
+        status_row = db.query(models.UserCaseStatus).filter(
+            models.UserCaseStatus.user_id == current_user['id'],
+            models.UserCaseStatus.case_id == req.case_id
+        ).first()
+
+        if status_row and status_row.success:
+            raise HTTPException(status_code=400, detail="This case is already closed.")
+
         is_correct = bool(suspect.is_guilty)
 
-        # Let Gemini write the dramatic conclusion
         prompt = f"""
-        You are a master mystery writer. The investigator has just made their final accusation in the case: "{case.title}".
-        They formally accused: {suspect.name}.
-        
+        You are writing the ending of a detective story. The investigator just accused: {suspect.name}.
         Was this the correct guilty suspect? {"YES" if is_correct else "NO"}.
-        
-        Write a dramatic, 2-paragraph conclusion to the game. 
-        If they are RIGHT: Describe how the suspect breaks down, confesses to the crime, and reveals their dark motive.
-        If they are WRONG: Describe how the innocent suspect is forcefully arrested, how the real killer slips away into the shadows, and how the investigator is disgraced.
-        
-        Keep it gritty, cinematic, and in the tone of a cyberpunk noir thriller. Do not use markdown formatting, just plain text paragraphs.
+
+        Write like a true-crime podcast script, not a novel. Short sentences. Punchy. No metaphors, no flowery imagery.
+
+        BANNED WORDS: shadow, whisper, veil, laser, neon, chrome, cryo, gilded, tapestry, enigma, palpable, visceral, labyrinth.
+
+        If they are RIGHT: The suspect breaks and confesses. Reveal their motive plainly, in 1-2 sentences.
+        If they are WRONG: Say plainly that this wasn't the right person, and that the investigation continues.
+
+        Write exactly 2 short paragraphs. 4-5 sentences each, max. Plain text, no markdown.
         """
-        
+
         model = genai.GenerativeModel('gemini-2.5-flash')
         response = model.generate_content(prompt)
+        narrative = response.text.strip()
+
+        user = db.query(models.User).filter(models.User.id == current_user['id']).first()
+
+        if not status_row:
+            status_row = models.UserCaseStatus(user_id=current_user['id'], case_id=req.case_id, wrong_attempts=0)
+            db.add(status_row)
+
+        status_row.accused_suspect_id = req.suspect_id
+        status_row.narrative = narrative
+        status_row.success = is_correct
+
+        if is_correct:
+            user.rating = (user.rating or 100) + 15
+            user.cases_solved = (user.cases_solved or 0) + 1
+        else:
+            status_row.wrong_attempts = (status_row.wrong_attempts or 0) + 1
+            user.rating = max(0, (user.rating or 100) - 5)
+            user.cases_failed = (user.cases_failed or 0) + 1
+
+        db.commit()
 
         return {
             "success": is_correct,
-            "narrative": response.text.strip()
+            "narrative": narrative,
+            "rating": user.rating,
+            "attempts": status_row.wrong_attempts
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Accusation Error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to process accusation.")
+
+@router.get("/reveal-truth/{case_id}")
+def reveal_truth(case_id: int, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    status_row = db.query(models.UserCaseStatus).filter(
+        models.UserCaseStatus.user_id == current_user['id'],
+        models.UserCaseStatus.case_id == case_id
+    ).first()
+
+    if not status_row:
+        raise HTTPException(status_code=403, detail="Make an accusation first.")
+
+    guilty_suspect = db.query(models.Suspect).filter(
+        models.Suspect.case_id == case_id,
+        models.Suspect.is_guilty == 1
+    ).first()
+
+    if not guilty_suspect:
+        raise HTTPException(status_code=404, detail="No culprit on record.")
+
+    return {"name": guilty_suspect.name, "description": guilty_suspect.description, "alibi": guilty_suspect.alibi}
+    
+
+@router.post("/progress/save")
+def save_evidence_progress(
+    request: ProgressRequest, 
+    db: Session = Depends(get_db), 
+    current_user: dict = Depends(get_current_user)
+):
+    user_id = current_user['id']
+    
+    existing = db.query(models.CaseProgress).filter(
+        models.CaseProgress.user_id == user_id,
+        models.CaseProgress.case_id == request.case_id,
+        models.CaseProgress.evidence_id == request.evidence_id
+    ).first()
+    
+    if not existing:
+        new_progress = models.CaseProgress(
+            user_id=user_id,
+            case_id=request.case_id,
+            evidence_id=request.evidence_id
+        )
+        db.add(new_progress)
+        db.commit()
+    
+    return {"status": "Evidence secured"}
+
+@router.get("/progress/{case_id}")
+def get_case_progress(
+    case_id: int, 
+    db: Session = Depends(get_db), 
+    current_user: dict = Depends(get_current_user)
+):
+    user_id = current_user['id']
+    
+    unlocked_nodes = db.query(models.CaseProgress.evidence_id).filter(
+        models.CaseProgress.user_id == user_id,
+        models.CaseProgress.case_id == case_id
+    ).all()
+    
+    return {"decrypted_ids": [node[0] for node in unlocked_nodes]}
+
+@router.post("/chat/save")
+def save_chat_message(
+    request: ChatRequest, 
+    db: Session = Depends(get_db), 
+    current_user: dict = Depends(get_current_user)
+):
+    user_id = current_user['id']
+    
+    new_message = models.ChatMessage(
+        user_id=user_id,
+        case_id=request.case_id,
+        suspect_id=request.suspect_id,
+        role=request.role,
+        text=request.text
+    )
+    db.add(new_message)
+    db.commit()
+    return {"status": "Message logged"}
+
+@router.get("/chat/{case_id}/{suspect_id}")
+def get_chat_history(
+    case_id: int, 
+    suspect_id: int, 
+    db: Session = Depends(get_db), 
+    current_user: dict = Depends(get_current_user)
+):
+    user_id = current_user['id']
+    
+    history = db.query(models.ChatMessage).filter(
+        models.ChatMessage.user_id == user_id,
+        models.ChatMessage.case_id == case_id,
+        models.ChatMessage.suspect_id == suspect_id
+    ).order_by(models.ChatMessage.timestamp.asc()).all()
+    
+    return [{"role": msg.role, "text": msg.text} for msg in history]
+
+
+@router.get("/resolve/{case_id}")
+def get_resolution(
+    case_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    status_row = db.query(models.UserCaseStatus).filter(
+        models.UserCaseStatus.user_id == current_user['id'],
+        models.UserCaseStatus.case_id == case_id
+    ).first()
+    if not status_row:
+        return None
+    return {
+        "success": status_row.success,
+        "narrative": status_row.narrative,
+        "accused_suspect_id": status_row.accused_suspect_id
+    }

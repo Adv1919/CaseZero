@@ -6,6 +6,7 @@ import models
 from database import engine
 from routers import auth, ai_generator 
 
+
 # Ensure tables are dynamically built in SQLite
 models.Base.metadata.create_all(bind=engine)
 
